@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from scipy.spatial import distance
+from scipy.optimize import linear_sum_assignment
 import pandas as pd
 
 # ── Load Track from CSV ───────────────────────────────────────────────────────
@@ -153,6 +154,8 @@ class Bot:
 
 # ──  Solution ──────────────────────────────────────────────────────────
 class Solution(Bot):
+    GATE_DIST = 3.0   # Mahalanobis-style distance gate (metres)
+
     def __init__(self):
         super().__init__()
         self.learned_map  = []                    # list of np.ndarray (2,)
@@ -163,11 +166,21 @@ class Solution(Bot):
     # ------------------------------------------------------------------
     def data_association(self, measurements, current_map):
         """
-        Nearest-Neighbour data association.
+        Gated Hungarian (globally optimal) data association.
+
         Steps:
           1. Transform local measurements → world frame using current pose.
-          2. For each measurement find the nearest cone in *current_map*.
-        Returns an int array of indices into current_map.
+          2. Build cost matrix (Euclidean distance) between measurements
+             and current_map landmarks.
+          3. Apply a distance gate: pairs exceeding GATE_DIST are set to a
+             large penalty so the Hungarian solver avoids them.
+          4. Solve the optimal 1-to-1 assignment with linear_sum_assignment.
+          5. Assignments whose original (un-penalised) distance exceeds the
+             gate are flagged as -1 (outlier / new landmark).
+
+        Returns an int array of length len(measurements).
+          - idx >= 0  → matched to current_map[idx]
+          - idx == -1 → unmatched (outlier or new landmark)
         """
         if len(measurements) == 0 or len(current_map) == 0:
             self._global_meas = np.zeros((0, 2))
@@ -177,8 +190,22 @@ class Solution(Bot):
         gm = local_to_global(measurements, self.pos, self.heading)
         self._global_meas = gm
 
-        D           = distance.cdist(gm, current_map)
-        self._assoc = np.argmin(D, axis=1)
+        # ── Cost matrix with gating ──
+        D = distance.cdist(gm, current_map)        # (M, N)
+        BIG = 1e6                                    # penalty for gated-out pairs
+        D_gated = np.where(D <= self.GATE_DIST, D, BIG)
+
+        # ── Globally optimal assignment (Hungarian) ──
+        row_ind, col_ind = linear_sum_assignment(D_gated)
+
+        # Build result: default -1 (unmatched)
+        assoc = np.full(len(gm), -1, dtype=int)
+        for r, c in zip(row_ind, col_ind):
+            if D[r, c] <= self.GATE_DIST:
+                assoc[r] = c                        # valid match
+            # else: stays -1 (outlier / beyond gate)
+
+        self._assoc = assoc
         return self._assoc
 
 # ── Problem 1 – Data Association ──────────────────────────────────────────────
@@ -204,12 +231,20 @@ def make_problem1():
 
         if len(sol._global_meas) > 0:
             for idx, gm in zip(sol._assoc, sol._global_meas):
-                mc = MAP_CONES[idx]
-                ax.plot([gm[0], mc[0]], [gm[1], mc[1]],
-                        "g--", lw=1.0, alpha=0.65, zorder=3)
-            ax.scatter(sol._global_meas[:, 0], sol._global_meas[:, 1],
-                       c="cyan", s=45, zorder=5,
-                       label=f"Measurements ({len(sol._global_meas)})")
+                if idx >= 0:
+                    mc = MAP_CONES[idx]
+                    ax.plot([gm[0], mc[0]], [gm[1], mc[1]],
+                            "g--", lw=1.0, alpha=0.65, zorder=3)
+            matched   = sol._global_meas[sol._assoc >= 0]
+            unmatched = sol._global_meas[sol._assoc < 0]
+            if len(matched) > 0:
+                ax.scatter(matched[:, 0], matched[:, 1],
+                           c="cyan", s=45, zorder=5,
+                           label=f"Matched ({len(matched)})")
+            if len(unmatched) > 0:
+                ax.scatter(unmatched[:, 0], unmatched[:, 1],
+                           c="red", marker="x", s=50, zorder=5,
+                           label=f"Outliers ({len(unmatched)})")
 
         draw_car(ax, sol.pos, sol.heading)
         setup_ax(ax, f"Frame {frame+1}/{N_FRAMES}  –  "
