@@ -141,26 +141,104 @@ class Bot:
 
 # ──  Solution ──────────────────────────────────────────────────────────
 class Solution(Bot):
+    """
+    Extended Kalman Filter (EKF) localization.
+
+    State vector: [x, y, ψ]  (position + heading)
+    Predict:  bicycle kinematic model + Jacobian covariance propagation
+    Update:   range-bearing observations to known map landmarks
+    """
     def __init__(self):
         super().__init__()
-        self.learned_map  = []                    # list of np.ndarray (2,)
-        # Internal state exposed for visualisation
+        self.learned_map  = []
         self._global_meas = np.zeros((0, 2))
         self._assoc       = np.array([], dtype=int)
 
+        # ── EKF state ──
+        self.P = np.diag([0.1, 0.1, 0.01])          # initial covariance
+        self.Q = np.diag([0.05**2, 0.05**2, 0.005**2])  # process noise
+        self.R_obs = np.diag([0.3**2, 0.05**2])      # observation noise [range, bearing]
+
     # ------------------------------------------------------------------
-    def localization(self, velocity, steering):
+    def localization(self, velocity, steering, measurements=None):
         """
-        Bicycle kinematic model (dead reckoning):
-            ẋ = v·cos(ψ)
-            ẏ = v·sin(ψ)
-            ψ̇ = (v / L)·tan(δ)
+        EKF-based localization with bicycle model predict + landmark update.
+
+        Parameters
+        ----------
+        velocity  : float — forward speed (m/s)
+        steering  : float — steering angle (rad)
+        measurements : np.ndarray (M,2) | None
+            Noisy local-frame measurements to known map cones.
+            If provided, an EKF observation update is performed.
         """
-        self.pos[0]  += velocity * np.cos(self.heading) * DT
-        self.pos[1]  += velocity * np.sin(self.heading) * DT
-        self.heading  = angle_wrap(
-            self.heading + (velocity / WHEELBASE) * np.tan(steering) * DT
-        )
+        # ── PREDICT ──────────────────────────────────────────────────
+        x, y, psi = self.pos[0], self.pos[1], self.heading
+
+        x_new   = x + velocity * np.cos(psi) * DT
+        y_new   = y + velocity * np.sin(psi) * DT
+        psi_new = angle_wrap(psi + (velocity / WHEELBASE) * np.tan(steering) * DT)
+
+        # Jacobian of motion model w.r.t. state
+        F = np.array([
+            [1, 0, -velocity * np.sin(psi) * DT],
+            [0, 1,  velocity * np.cos(psi) * DT],
+            [0, 0,  1],
+        ])
+
+        self.pos[0]  = x_new
+        self.pos[1]  = y_new
+        self.heading  = psi_new
+        self.P = F @ self.P @ F.T + self.Q
+
+        # ── UPDATE (observation correction) ───────────────────────────
+        if measurements is not None and len(measurements) > 0 and len(MAP_CONES) > 0:
+            # Transform local measurements to global frame for matching
+            gm = local_to_global(measurements, self.pos, self.heading)
+
+            for i, z_global in enumerate(gm):
+                # Find nearest known landmark
+                dists = np.linalg.norm(MAP_CONES - z_global, axis=1)
+                j = int(np.argmin(dists))
+                if dists[j] > 3.0:
+                    continue   # skip outlier
+
+                lm = MAP_CONES[j]
+
+                # Expected range and bearing to landmark j
+                dx = lm[0] - self.pos[0]
+                dy = lm[1] - self.pos[1]
+                r_exp  = np.sqrt(dx**2 + dy**2)
+                b_exp  = angle_wrap(np.arctan2(dy, dx) - self.heading)
+
+                if r_exp < 1e-6:
+                    continue
+
+                # Actual range and bearing from local measurement
+                z_local = measurements[i]
+                r_meas  = np.linalg.norm(z_local)
+                b_meas  = np.arctan2(z_local[1], z_local[0])
+
+                # Innovation
+                innovation = np.array([
+                    r_meas - r_exp,
+                    angle_wrap(b_meas - b_exp),
+                ])
+
+                # Observation Jacobian H (range-bearing w.r.t. [x, y, psi])
+                H = np.array([
+                    [-dx / r_exp, -dy / r_exp,  0],
+                    [ dy / r_exp**2, -dx / r_exp**2, -1],
+                ])
+
+                S = H @ self.P @ H.T + self.R_obs
+                K = self.P @ H.T @ np.linalg.inv(S)
+
+                update = K @ innovation
+                self.pos[0]  += update[0]
+                self.pos[1]  += update[1]
+                self.heading  = angle_wrap(self.heading + update[2])
+                self.P = (np.eye(3) - K @ H) @ self.P
 
 
 # ── Problem 2 – Localization ───────────────────────────────────────────────────
@@ -179,7 +257,8 @@ def make_problem2():
     def update(frame):
         ax.clear()
         steer = pure_pursuit(sol.pos, sol.heading, CENTERLINE)
-        sol.localization(SPEED, steer)
+        meas  = get_measurements(sol.pos, sol.heading)   # sensor observations
+        sol.localization(SPEED, steer, measurements=meas)
         path_x.append(float(sol.pos[0]))
         path_y.append(float(sol.pos[1]))
 
